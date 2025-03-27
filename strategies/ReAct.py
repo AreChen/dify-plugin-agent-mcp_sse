@@ -26,11 +26,13 @@ from dify_plugin.interfaces.agent import (
     AgentStrategy,
     ToolEntity,
 )
+from mcp import types
 from pydantic import BaseModel, Field
 
 from output_parser.cot_output_parser import CotAgentOutputParser
 from prompt.template import REACT_PROMPT_TEMPLATES
-from utils.mcp_client import McpClientsUtil
+from utils import mcp_sse_util
+from utils.mcp_sse_util import McpSseClient
 
 ignore_observation_providers = ["wenxin"]
 
@@ -101,7 +103,7 @@ class ReActAgentStrategy(AgentStrategy):
         tool_instances = {tool.identity.name: tool for tool in tools} if tools else {}
 
         # Fetch MCP tools
-        servers_config = {}
+        mcp_clients = []
         mcp_tools = []
         mcp_tool_instances = {}
         servers_config_json = react_params.mcp_servers_config
@@ -111,8 +113,11 @@ class ReActAgentStrategy(AgentStrategy):
                 servers_config = json.loads(servers_config_json)
             except json.JSONDecodeError as e:
                 raise ValueError(f"mcp_servers_config must be a valid JSON string: {e}")
-            mcp_tools = McpClientsUtil.fetch_tools(servers_config)
-            mcp_tool_instances = {tool.get("name"): tool for tool in mcp_tools} if mcp_tools else {}
+            mcp_clients = [
+                McpSseClient(name, config) for name, config in servers_config.items()
+            ]
+            mcp_tools = mcp_sse_util.fetch_mcp_tools(mcp_clients)
+            mcp_tool_instances = {tool.name: tool for tool in mcp_tools} if mcp_tools else {}
 
         react_params.model.completion_params = (
                 react_params.model.completion_params or {}
@@ -297,7 +302,7 @@ class ReActAgentStrategy(AgentStrategy):
                         self._handle_invoke_action(
                             action=scratchpad.action,
                             tool_instances=tool_instances,
-                            servers_config=servers_config,
+                            mcp_clients=mcp_clients,
                             mcp_tool_instances=mcp_tool_instances,
                             message_file_ids=message_file_ids,
                         )
@@ -487,15 +492,15 @@ class ReActAgentStrategy(AgentStrategy):
     def _handle_invoke_action(
             self,
             action: AgentScratchpadUnit.Action,
-            servers_config: dict[str, Any],
+            mcp_clients: list[McpSseClient],
             tool_instances: Mapping[str, ToolEntity],
-            mcp_tool_instances: Mapping[str, dict],
+            mcp_tool_instances: Mapping[str, types.Tool],
             message_file_ids: list[str],
     ) -> tuple[str, dict[str, Any] | str]:
         """
         handle invoke action
         :param action: action
-        :param servers_config: MCP Servers config
+        :param mcp_clients: MCP clients
         :param tool_instances: tool instances
         :param mcp_tool_instances: MCP tool instances
         :param message_file_ids: message file ids
@@ -530,10 +535,10 @@ class ReActAgentStrategy(AgentStrategy):
             if mcp_tool_instance:
                 # invoke MCP tool
                 tool_invoke_parameters = tool_call_args
-                result = McpClientsUtil.execute_tool(
-                    servers_config=servers_config,
-                    tool_name=tool_call_name,
-                    tool_args=tool_invoke_parameters,
+                result = mcp_sse_util.execute_mcp_tool(
+                    clients=mcp_clients,
+                    tool_name=mcp_tool_instance.name,
+                    arguments=tool_invoke_parameters,
                 )
             else:
                 # invoke tool
@@ -683,7 +688,7 @@ class ReActAgentStrategy(AgentStrategy):
         return current_session_messages or []
 
     @staticmethod
-    def _init_prompt_mcp_tools(mcp_tools: list[dict]) -> list[PromptMessageTool]:
+    def _init_prompt_mcp_tools(mcp_tools: list[types.Tool]) -> list[PromptMessageTool]:
         """
         Initialize prompt message MCP tools
         """
@@ -691,9 +696,9 @@ class ReActAgentStrategy(AgentStrategy):
 
         for tool in mcp_tools:
             prompt_message = PromptMessageTool(
-                name=tool.get("name"),
-                description=tool.get("description", None),
-                parameters=tool.get("inputSchema"),
+                name=tool.name,
+                description=tool.description,
+                parameters=tool.inputSchema,
             )
             prompt_messages_tools.append(prompt_message)
 
